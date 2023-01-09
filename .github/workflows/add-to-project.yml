@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION.
+# Copyright (c) 2022, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,9 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-[driver] {
- "spark.plugins" = "com.nvidia.spark.SQLPlugin"
- "spark.rapids.memory.pinnedPool.size" = "2G"
- "spark.sql.files.maxPartitionBytes" = "512m"
- "spark.rapids.sql.concurrentGpuTasks" = "2"
-}
+
+name: Add new issues and pull requests to project
+
+on:
+  issues:
+    types:
+      - opened
+  pull_request_target:
+    types:
+      - opened
+
+jobs:
+  add-to-project:
+    if: github.repository == 'NVIDIA/spark-rapids-container'
+    name: Add new issues and pull requests to project
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/add-to-project@v0.4.0
+        with:
+          project-url: https://github.com/orgs/NVIDIA/projects/4
+          github-token: ${{ secrets.PROJECT_TOKEN }}

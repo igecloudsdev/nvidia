@@ -25,7 +25,7 @@
 ####################
 # Global constants #
 ####################
-readonly ALLUXIO_VERSION="2.8.0"
+readonly ALLUXIO_VERSION="2.9.0"
 readonly ALLUXIO_HOME="/opt/alluxio-${ALLUXIO_VERSION}"
 readonly ALLUXIO_SITE_PROPERTIES="${ALLUXIO_HOME}/conf/alluxio-site.properties"
 readonly ALLUXIO_METRICS_PROPERTIES_TEMPLATE="${ALLUXIO_HOME}/conf/metrics.properties.template"
@@ -37,6 +37,12 @@ ALLUXIO_WORKER_DIRECT_HEAP=${ALLUXIO_WORKER_DIRECT_HEAP:-'4g'}
 # location to copy the Alluxio logs to so that they are kept after cluster is shutdown
 # recommended location would be dbfs on Databricks, path has to be accessible via rsync
 ALLUXIO_COPY_LOG_PATH=${ALLUXIO_COPY_LOG_PATH:-''}
+
+# Prometheus
+readonly PROMETHEUS_VERSION=2.37.3
+readonly PROMETHEUS_HOME=/opt/prometheus-${PROMETHEUS_VERSION}.linux-amd64
+readonly PROMETHEUS_CFG_PATH=${PROMETHEUS_HOME}/prometheus.yml
+PROMETHEUS_COPY_DATA_PATH=${PROMETHEUS_COPY_DATA_PATH:-''}
 
 # Run a command as a specific user
 # Assumes the provided user already exists on the system and user running script has sudo access
@@ -155,7 +161,7 @@ configure_nvme() {
   echo "${use_mem}"
 }
 
-# add crontab to rsync alluxio log to /dbfs/cluster-logs/alluxio
+# add crontab to rsync alluxio log to $ALLUXIO_COPY_LOG_PATH
 set_crontab_alluxio_log() {
   if [[ "$#" -ne "1" ]]; then
     echo "Incorrect"
@@ -170,6 +176,21 @@ set_crontab_alluxio_log() {
   rm cron_bkp
 }
 
+# add crontab to rsync Prometheus data to ${PROMETHEUS_COPY_DATA_PATH}
+set_crontab_prometheus_data() {
+  if [[ "$#" -ne "1" ]]; then
+    echo "Incorrect"
+    exit 2
+  fi
+  local folder=$1
+  mkdir -p ${PROMETHEUS_COPY_DATA_PATH}/$folder
+  # add crond to copy Prometheus data
+  crontab -l > cron_bkp || true
+  echo "* * * * * /usr/bin/rsync -a ${PROMETHEUS_HOME}/data ${PROMETHEUS_COPY_DATA_PATH}/$folder >/dev/null 2>&1" >> cron_bkp
+  crontab cron_bkp
+  rm cron_bkp
+}
+
 start_ssh() {
   # Start SSH
   service ssh start
@@ -178,6 +199,7 @@ start_ssh() {
 config_alluxio() {
 
   # create the folder for NVMe caching
+  chown -R ubuntu:ubuntu /opt/alluxio*
   mkdir -p /local_disk0/cache
   chown ubuntu:ubuntu /local_disk0/cache
 
@@ -209,6 +231,11 @@ config_alluxio() {
     if [[ -n $ALLUXIO_COPY_LOG_PATH ]]; then
       set_crontab_alluxio_log "${DB_DRIVER_IP}-master"
     fi
+
+    if [[ -n $PROMETHEUS_COPY_DATA_PATH ]]; then
+      set_crontab_prometheus_data "${DB_DRIVER_IP}-master"
+    fi
+
     MASTER_HEAP_SETTING="-Xms${ALLUXIO_MASTER_HEAP} -Xmx${ALLUXIO_MASTER_HEAP}"
 
     # start master, alluxio-start.sh will do some initialization
@@ -221,13 +248,47 @@ config_alluxio() {
     # supervisor manages processes by subprocess, here we can't use `alluxio-start.sh` as command directly because of `nohup` in it
     cat > /etc/supervisor/conf.d/alluxio-master.conf << EOF
 [program:alluxio-master]
-command=/usr/bin/java ${MASTER_HEAP_SETTING} -cp ${ALLUXIO_HOME}/conf/::${ALLUXIO_HOME}/assembly/alluxio-server-2.8.0.jar -Dalluxio.logger.type=MASTER_LOGGER -Dalluxio.master.audit.logger.type=MASTER_AUDIT_LOGGER -Dalluxio.home=${ALLUXIO_HOME} -Dalluxio.conf.dir=${ALLUXIO_HOME}/conf -Dalluxio.logs.dir=${ALLUXIO_HOME}/logs -Dalluxio.user.logs.dir=${ALLUXIO_HOME}/logs/user -Dlog4j.configuration=file:${ALLUXIO_HOME}/conf/log4j.properties -Dorg.apache.jasper.compiler.disablejsr199=true -Djava.net.preferIPv4Stack=true -Dorg.apache.ratis.thirdparty.io.netty.allocator.useCacheForAllThreads=false -XX:MetaspaceSize=256M alluxio.master.AlluxioMaster
+command=/usr/bin/java ${MASTER_HEAP_SETTING} -cp ${ALLUXIO_HOME}/conf/::${ALLUXIO_HOME}/assembly/alluxio-server-${ALLUXIO_VERSION}.jar -Dalluxio.logger.type=MASTER_LOGGER -Dalluxio.master.audit.logger.type=MASTER_AUDIT_LOGGER -Dalluxio.home=${ALLUXIO_HOME} -Dalluxio.conf.dir=${ALLUXIO_HOME}/conf -Dalluxio.logs.dir=${ALLUXIO_HOME}/logs -Dalluxio.user.logs.dir=${ALLUXIO_HOME}/logs/user -Dlog4j.configurationFile=file:${ALLUXIO_HOME}/conf/log4j2-master.properties -Dorg.apache.jasper.compiler.disablejsr199=true -Djava.net.preferIPv4Stack=true -Dorg.apache.ratis.thirdparty.io.netty.allocator.useCacheForAllThreads=false -XX:MetaspaceSize=256M alluxio.master.AlluxioMaster
 user=ubuntu
 autostart=true ;auto start this program when supervisord starting
 autorestart=true ;supervisord auto starts this program if program crashes
 stderr_logfile=${ALLUXIO_HOME}/logs/alluxio-master.err
 stdout_logfile=${ALLUXIO_HOME}/logs/alluxio-master.out
 EOF
+
+    # Prometheus
+    if [[ -n ${PROMETHEUS_COPY_DATA_PATH} ]]; then
+      # config Prometheus
+      mkdir ${PROMETHEUS_HOME}/logs
+      chown -R ubuntu:ubuntu /opt/prometheus*
+
+      cat > ${PROMETHEUS_CFG_PATH} << EOF
+global:
+  scrape_interval: 15s # Set the scrape interval to every 15 seconds. Default is every 1 minute.
+scrape_configs:
+  - job_name: "alluxio master"
+    metrics_path: 'metrics/prometheus/'
+    static_configs:
+      - targets: ["localhost:19999"] # pull metrics from master
+EOF
+      # TODO, how to add targets to pull worker metrics data into Prometheus?
+      # In here do not know the worker IPs.
+      # targets: ["worker-ip:30000"]
+
+      # add supervisor conf for Prometheus
+      cat > /etc/supervisor/conf.d/prometheus.conf << EOF
+[program:prometheus]
+command=${PROMETHEUS_HOME}/prometheus --storage.tsdb.path=${PROMETHEUS_HOME}/data --config.file=${PROMETHEUS_HOME}/prometheus.yml
+user=ubuntu
+autostart=true ;auto start this program when supervisord starting
+autorestart=true ;supervisord auto starts this program if program crashes
+stderr_logfile=${PROMETHEUS_HOME}/logs/prometheus.err
+stdout_logfile=${PROMETHEUS_HOME}/logs/prometheus.out
+EOF
+
+      # enable Alluxio web service to expose the metrics data in Prometheus type. This is used by Prometheus to pull metrics data.
+      set_metrics_property sink.prometheus.class alluxio.metrics.sink.PrometheusMetricsServlet
+    fi
 
   else
     # On Workers
@@ -240,7 +301,7 @@ EOF
     # add supervisor conf for worker
     cat > /etc/supervisor/conf.d/alluxio-worker.conf << EOF
 [program:alluxio-worker]
-command=/usr/bin/java -Xmx${ALLUXIO_WORKER_HEAP} -XX:MaxDirectMemorySize=${ALLUXIO_WORKER_DIRECT_HEAP} -cp ${ALLUXIO_HOME}/conf/::${ALLUXIO_HOME}/assembly/alluxio-server-2.8.0.jar -Dalluxio.logger.type=WORKER_LOGGER -Dalluxio.home=${ALLUXIO_HOME} -Dalluxio.conf.dir=${ALLUXIO_HOME}/conf -Dalluxio.logs.dir=${ALLUXIO_HOME}/logs -Dalluxio.user.logs.dir=${ALLUXIO_HOME}/logs/user -Dlog4j.configuration=file:${ALLUXIO_HOME}/conf/log4j.properties -Dorg.apache.jasper.compiler.disablejsr199=true -Djava.net.preferIPv4Stack=true -Dorg.apache.ratis.thirdparty.io.netty.allocator.useCacheForAllThreads=false alluxio.worker.AlluxioWorker
+command=/usr/bin/java -Xmx${ALLUXIO_WORKER_HEAP} -XX:MaxDirectMemorySize=${ALLUXIO_WORKER_DIRECT_HEAP} -cp ${ALLUXIO_HOME}/conf/::${ALLUXIO_HOME}/assembly/alluxio-server-${ALLUXIO_VERSION}.jar -Dalluxio.logger.type=WORKER_LOGGER -Dalluxio.home=${ALLUXIO_HOME} -Dalluxio.conf.dir=${ALLUXIO_HOME}/conf -Dalluxio.logs.dir=${ALLUXIO_HOME}/logs -Dalluxio.user.logs.dir=${ALLUXIO_HOME}/logs/user -Dlog4j.configurationFile=file:${ALLUXIO_HOME}/conf/log4j2-worker.properties -Dorg.apache.jasper.compiler.disablejsr199=true -Djava.net.preferIPv4Stack=true -Dorg.apache.ratis.thirdparty.io.netty.allocator.useCacheForAllThreads=false alluxio.worker.AlluxioWorker
 user=ubuntu
 autostart=true ;auto start this program when supervisord starting
 autorestart=true ;supervisord auto starts this program if program crashes
@@ -256,6 +317,6 @@ start_ssh
 if [[ "$ENABLE_ALLUXIO" = "1" ]]; then
   config_alluxio
   # start supervisord, and supervisord starts alluxio
-  # supervisord will restart alluxio if alluxio crashes
+  # supervisord will restart programs Alluxio, Prometheus, etc. if they crash
   /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
 fi

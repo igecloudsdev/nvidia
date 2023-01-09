@@ -54,7 +54,7 @@ RUN set -ex && \
     apt-get install -y less vim && \
     /var/lib/dpkg/info/ca-certificates-java.postinst configure && \
     # Initialize the default environment that Spark and notebooks will use
-    virtualenv -p python3.8 --system-site-packages /databricks/python3 --no-download --no-setuptools \
+    virtualenv -p python3.8 --system-site-packages /databricks/python3 --no-download --no-setuptools --wheel 0.38.4 \
         && /databricks/python3/bin/pip install --no-cache-dir --upgrade pip \
         && /databricks/python3/bin/pip install \
             databricks-cli \
@@ -96,8 +96,8 @@ FROM base as with-plugin
 # Spark RAPIDS configuration
 #############
 ARG DRIVER_CONF_FILE=00-custom-spark-driver-defaults.conf
-ARG JAR_FILE=rapids-4-spark_2.12-22.10.0.jar
-ARG JAR_URL=https://repo1.maven.org/maven2/com/nvidia/rapids-4-spark_2.12/22.10.0/${JAR_FILE}
+ARG JAR_FILE=rapids-4-spark_2.12-22.12.0.jar
+ARG JAR_URL=https://repo1.maven.org/maven2/com/nvidia/rapids-4-spark_2.12/22.12.0/${JAR_FILE}
 ARG INIT_SCRIPT=init.sh
 COPY ${DRIVER_CONF_FILE} /databricks/driver/conf/00-custom-spark-driver-defaults.conf
 
@@ -109,10 +109,25 @@ RUN chmod 755 /opt/spark-rapids/init.sh
 
 WORKDIR /databricks
 
+# libganglia1 in ubuntu 20.04 actually is missing the modpython.so library
+# needed for the GPU metrics plugin 
+# this is actually a known packaging bug in Ubuntu
+# See https://bugs.launchpad.net/ubuntu/+source/ganglia/+bug/1894045
+# Therefore we need to download the package from Ubuntu 18.04 (which includes 
+# the missing library)
+FROM ubuntu:18.04 as download-modpython
+
+RUN cd /tmp && \
+  apt-get -y update && \
+  apt-get -y download libganglia1 && \
+  ls -al
+
 #############
 # Setup Ganglia
 #############
 FROM with-plugin as with-ganglia
+
+ARG GANGLIA_WEBROOT=/usr/share/ganglia-webfrontend
 
 WORKDIR /databricks
 ENV DEBIAN_FRONTEND=noninteractive
@@ -120,6 +135,7 @@ RUN apt-get update && apt-get install -q -y --force-yes --fix-missing --ignore-m
         ganglia-monitor \
         ganglia-webfrontend \
         ganglia-monitor-python \
+        libpython2.7 \
         python3-pip \
         wget \
         rsync \
@@ -143,6 +159,13 @@ RUN cd /tmp \
   && tar xvjf $PHANTOM_JS.tar.bz2 \
   && mv $PHANTOM_JS /usr/local/share \
   && ln -sf /usr/local/share/$PHANTOM_JS/bin/phantomjs /usr/local/bin
+# Install ganglia modpython from Ubuntu 18.04
+COPY --from=download-modpython /tmp/libganglia1_*.deb /tmp
+RUN cd /tmp \
+  && mkdir -p /tmp/libganglia1 \
+  && dpkg-deb -xv libganglia1_*.deb /tmp/libganglia1 \
+  && cp /tmp/libganglia1/usr/lib/ganglia/modpython.so /usr/lib/ganglia/ \
+  && rm -rf /tmp/libganglia1
 # Apache2 config. The `sites-enabled` config files are loaded into the container
 # later.
 RUN rm /etc/apache2/sites-enabled/* && a2enmod proxy && a2enmod proxy_http
@@ -173,15 +196,24 @@ check process spark-slave with pidfile /tmp/spark-root-org.apache.spark.deploy.w
 RUN mkdir -p /etc/apache2/sites-enabled
 ADD ganglia/ganglia.conf /etc/apache2/sites-enabled
 RUN chmod 775 /etc/apache2/sites-enabled/ganglia.conf
-ADD ganglia/gconf/* /etc/ganglia/
+ADD ganglia/gconf/*.conf /etc/ganglia/
 RUN mkdir -p /databricks/spark/scripts/ganglia/
 RUN mkdir -p /databricks/spark/scripts/
+RUN mkdir -p $GANGLIA_WEBROOT/graph.d
 ADD ganglia/start_spark_slave.sh /databricks/spark/scripts/start_spark_slave.sh
 
 # add local monit shell script in the right location
 RUN mkdir -p /etc/init.d
 ADD scripts/monit /etc/init.d
 RUN chmod 775 /etc/init.d/monit
+
+# For GPU monitoring in Ganglia, you need the modules available here:
+# https://github.com/ganglia/gmond_python_modules/tree/master/gpu/nvidia/python_modules
+ADD ganglia/gconf/conf.d/* /etc/ganglia/conf.d/
+ADD ganglia/python_modules/* /usr/lib/ganglia/python_modules
+RUN /usr/bin/pip install --upgrade  -t /usr/lib/ganglia/python_modules/ nvidia-ml-py
+
+# Copy the files needed for GPU monitoring in Ganglia
 
 #############
 # Set up webterminal ssh
@@ -211,15 +243,24 @@ FROM with-webterminal as with-alluxio
 #############
 # Setup Alluxio
 #############
-ARG ALLUXIO_VERSION=2.8.0
+RUN apt-get update && apt-get install -q -y git maven
+ARG ALLUXIO_VERSION=2.9.0
 ARG ALLUXIO_HOME="/opt/alluxio-${ALLUXIO_VERSION}"
 ARG ALLUXIO_TAR_FILE="alluxio-${ALLUXIO_VERSION}-bin.tar.gz"
-ARG ALLUXIO_DOWNLOAD_URL="https://downloads.alluxio.io/downloads/files/${ALLUXIO_VERSION}/${ALLUXIO_TAR_FILE}"
+ADD Alluxio-2.9.0-without-CVE /tmp/Alluxio-2.9.0-without-CVE
+# clone 2.9.0 source, fix CVE issues, compile, then install to /opt/alluxio-x.x.x
+RUN /tmp/Alluxio-2.9.0-without-CVE/build-from-src-and-fix-CVE.sh
+RUN cp ${ALLUXIO_HOME}/client/alluxio-${ALLUXIO_VERSION}-client.jar /databricks/jars/
 
-RUN wget -O /tmp/$ALLUXIO_TAR_FILE ${ALLUXIO_DOWNLOAD_URL} \
-    && tar zxf /tmp/${ALLUXIO_TAR_FILE} -C /opt/ \
-    && rm -f /tmp/${ALLUXIO_TAR_FILE} \
-    && cp ${ALLUXIO_HOME}/client/alluxio-${ALLUXIO_VERSION}-client.jar /databricks/jars/
+#############
+# Setup Prometheus
+#############
+ARG PROMETHEUS_VERSION=2.37.3
+ARG PROMETHEUS_TAR_FILE=prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz
+ARG PROMETHEUS_DOWNLOAD_URL=https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/${PROMETHEUS_TAR_FILE}
+RUN wget -O /tmp/${PROMETHEUS_TAR_FILE} ${PROMETHEUS_DOWNLOAD_URL} \
+    && tar zxf /tmp/${PROMETHEUS_TAR_FILE} -C /opt/ \
+    && rm -f /tmp/${PROMETHEUS_TAR_FILE}
 
 #############
 # Allow ubuntu user to sudo without password

@@ -99,8 +99,9 @@ spark.rapids.sql.coalescing.reader.numFilterParallel 2
 spark.rapids.sql.multiThreadedRead.numThreads 40
 ```
 
-4. In the `Environment variables` field, add the line `ENABLE_ALLUXIO=1`.
-
+4. In the `Environment variables` field, add the following lines:   
+    `ENABLE_ALLUXIO=1`   
+    `ALLUXIO_HOME=/opt/alluxio-2.9.0`   
 ![Environment-Variables-View](img/environment-variables.png)
 
 5. Customize Alluxio configuration using the following configs if needed. These should be added in the `Environment variables` field if you wish to change them.
@@ -109,11 +110,13 @@ spark.rapids.sql.multiThreadedRead.numThreads 40
 
   - The default heap size used by the Alluxio Master process is 16GB, this may need to be changed depending on the size of the driver node. Make sure it has enough memory for the Master and the Spark driver processes.  `ALLUXIO_MASTER_HEAP=16g`
 
-  - To copy the Alluxio Master and Worker logs off of local disk to be able to look at them after the cluster is shutdown you can configure this to some path accessible via rsync.  For instance, on Databricks this might be a path in /dbfs/.  `ALLUXIO_COPY_LOG_PATH=/dbfs/somedirectory/`
+  - To copy the Alluxio Master and Worker logs off of local disk to be able to look at them after the cluster is shutdown you can configure this to some path accessible via rsync.  For instance, on Databricks this might be a path in /dbfs/.  `ALLUXIO_COPY_LOG_PATH=/dbfs/somedirectory-for-alluxio-logs/`
 
-5. Click `Confirm` (if the cluster is currently stopped) or `Confirm and Restart` if the cluster is currently running.
+  - To copy the Alluxio metrics which are in Prometheus format to be able to look at them after the cluster is shutdown you can configure this to some path accessible via rsync. For instance, on Databricks this might be a path in /dbfs/.  `PROMETHEUS_COPY_DATA_PATH=/dbfs/somedirectory-for-alluxio-prometheus-metrics/`. The saved Prometheus data can be graphed outside of the cluster. For more details, refer to `spark-rapids/docs/get-started/getting-started-alluxio.md` in [spark-rapids doc](https://github.com/NVIDIA/spark-rapids)
 
-6. Ensure the cluster is started by click `Start` if necessary.
+6. Click `Confirm` (if the cluster is currently stopped) or `Confirm and Restart` if the cluster is currently running.
+
+7. Ensure the cluster is started by click `Start` if necessary.
 
 To verify the alluxio cluster is working, you can use the Web Terminal:
 
